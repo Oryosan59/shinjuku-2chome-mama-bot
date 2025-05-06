@@ -1,0 +1,20 @@
+# .envファイル (APIキーなどの秘密情報)
+.env
+
+# Python 仮想環境
+venv/
+
+# Python キャッシュファイル
+__pycache__/
+*.py[cod]
+
+# OS固有のファイル
+.DS_Store
+Thumbs.db
+
+# IDE/エディタ設定ファイル (例)
+.vscode/
+.idea/
+
+# ログファイル (もし生成するなら)
+*.log
