@@ -13,7 +13,7 @@ def synthesize_voice(text: str, speaker: int = VOICEVOX_SPEAKER_ID, output_path=
         # 音声生成のためのクエリ作成
         query_url = f"{VOICEVOX_BASE_URL}/audio_query"
         query_params = {"text": text, "speaker": speaker}
-        response_query = requests.post(query_url, params=query_params)
+        response_query = requests.post(query_url, params=query_params, timeout=10) # 10秒のタイムアウト
         response_query.raise_for_status()  # エラーがあれば例外を発生
 
         # 実際の音声を合成
@@ -24,7 +24,8 @@ def synthesize_voice(text: str, speaker: int = VOICEVOX_SPEAKER_ID, output_path=
             synthesis_url,
             params=synthesis_params,
             headers=synthesis_headers,
-            json=response_query.json()
+            json=response_query.json(),
+            timeout=30 # 音声合成は少し長めに30秒のタイムアウト
         )
         response_synthesis.raise_for_status() # エラーがあれば例外を発生
 
@@ -41,4 +42,3 @@ def synthesize_voice(text: str, speaker: int = VOICEVOX_SPEAKER_ID, output_path=
     except Exception as e:
         logger.error(f"VOICEVOX音声合成中に予期せぬエラー: {e}")
         return None
-

@@ -16,6 +16,8 @@ class MusicCog(commands.Cog):
         self.bot = bot
         self.vc_connections = {}  # ギルドID: discord.VoiceClient
         self.music_queues = {}    # ギルドID: list[tuple[str, str]] (song_path, song_name)
+        self.currently_playing_info = {} # ギルドID: {'path': str, 'name': str} 現在再生中の曲情報
+        self.song_details_to_resume_after_voice = {} # ギルドID: {'path': str, 'name': str} VoiceCogによる中断後再開する曲
         self._ensure_music_dir()
 
     def _ensure_music_dir(self):
@@ -45,42 +47,49 @@ class MusicCog(commands.Cog):
         return [f for f in os.listdir(MUSIC_DIR) if os.path.isfile(os.path.join(MUSIC_DIR, f)) and f.lower().endswith(supported_extensions)]
 
     def _after_playing(self, error, guild_id: int, song_name_played: str):
+        logger.info(f'_after_playing: Song "{song_name_played}" finished/stopped for guild {guild_id}. Error: {error}')
+        self.currently_playing_info.pop(guild_id, None) # 現在再生中の情報をクリア
+
         if error:
             logger.error(f'音楽再生エラー (ギルド {guild_id}, 曲: {song_name_played}): {error}')
+
+        # VoiceCogによる中断からの再開が保留されている場合は、自動で次の曲へは進まない
+        if guild_id not in self.song_details_to_resume_after_voice:
+            if self.bot.loop.is_running(): # ボットがまだ動作しているか確認
+                logger.info(f"_after_playing: Not a voice interruption, attempting to play next for guild {guild_id}")
+                asyncio.run_coroutine_threadsafe(self._play_next_song(guild_id), self.bot.loop)
+            else:
+                logger.warning(f"_after_playing: Bot loop not running, cannot play next song for guild {guild_id}")
         else:
-            logger.info(f'音楽再生完了 (ギルド {guild_id}, 曲: {song_name_played})')
-        
-        # 次の曲を再生するためのタスクを作成
-        # afterコールバックは同期的なコンテキストで実行されるため、非同期処理はスレッドセーフに呼び出す
-        if self.bot.loop.is_running(): # ボットがまだ動作しているか確認
-            asyncio.run_coroutine_threadsafe(self._play_next_song(guild_id), self.bot.loop)
-        else:
-            logger.warning(f"ボットループが実行されていないため、次の曲の再生を開始できません (ギルド {guild_id})")
+            logger.info(f"_after_playing: Voice interruption detected (resume pending for {self.song_details_to_resume_after_voice.get(guild_id, {}).get('name')}) for guild {guild_id}. Not playing next song automatically.")
+
+
 
     async def _play_next_song(self, guild_id: int):
         """キューから次の曲を再生する内部メソッド"""
-        if guild_id not in self.music_queues or not self.music_queues[guild_id]:
-            logger.info(f"音楽キューが空です (ギルド {guild_id})。再生を停止します。")
-            # オプション: キューが空になったらVCから自動退出するロジック
-            # vc = self.get_vc_connection(guild_id)
-            # if vc and vc.is_connected():
-            #     # await vc.channel.send("キューが空になったので、少ししたら退出するわね。")
-            #     # await asyncio.sleep(60) # 60秒後に退出など
-            #     # if not self.music_queues.get(guild_id): # 再度キューが空か確認
-            #     #    await vc.disconnect()
-            #     #    self.set_vc_connection(guild_id, None)
-            return
-
         current_vc = self.get_vc_connection(guild_id)
         if not current_vc or not current_vc.is_connected():
             logger.warning(f"VCに接続されていません。次の曲を再生できません (ギルド {guild_id})。")
             if guild_id in self.music_queues: # VCがないならキューもクリアした方が安全
                 self.music_queues[guild_id].clear()
             return
+        
+        logger.info(f"_play_next_song: Called for guild {guild_id}. VC Status - Playing: {current_vc.is_playing()}, Paused: {current_vc.is_paused()}")
+
+        if guild_id not in self.music_queues or not self.music_queues[guild_id]:
+            logger.info(f"_play_next_song: 音楽キューが空です (ギルド {guild_id})。再生を停止します。")
+            # オプション: キューが空になったらVCから自動退出するロジック
+            # if current_vc and current_vc.is_connected():
+            #     # await current_vc.channel.send("キューが空になったので、少ししたら退出するわね。")
+            #     # await asyncio.sleep(60) # 60秒後に退出など
+            #     # if not self.music_queues.get(guild_id): # 再度キューが空か確認
+            #     #    await current_vc.disconnect()
+            #     #    self.set_vc_connection(guild_id, None)
+            return
 
         if current_vc.is_playing() or current_vc.is_paused():
             # 通常、_after_playing から呼ばれるので、この状態は稀だが念のため
-            logger.info(f"VCは既に何かを再生/一時停止中です。_play_next_songの処理をスキップします (ギルド {guild_id})。")
+            logger.info(f"_play_next_song: VCは既に何かを再生/一時停止中です。処理をスキップします (ギルド {guild_id})。")
             return
 
         song_path, song_name = self.music_queues[guild_id].pop(0) # キューの先頭から取得して削除
@@ -89,23 +98,33 @@ class MusicCog(commands.Cog):
             logger.error(f"次の曲のファイルが見つかりません: {song_path} (ギルド {guild_id})")
             if current_vc.channel:
                 try:
-                    await current_vc.channel.send(f"あら、キューにあった '{song_name}' が見つからないみたい…？ スキップするわね。")
+                    # interactionがないので、テキストチャンネルに直接送信
+                    text_channel = self.bot.get_channel(current_vc.channel.id) # VCと同じIDのテキストチャンネルを探すのは適切ではない
+                                                                              # interactionから取得するか、最後に使ったチャンネルを記憶しておく必要がある
+                    logger.warning(f"_play_next_song: ファイル欠損通知の送信先チャンネル不明。'{song_name}'")
+                    # await current_vc.channel.send(f"あら、キューにあった '{song_name}' が見つからないみたい…？ スキップするわね。")
                 except Exception as e:
                     logger.error(f"ファイル欠損通知の送信エラー: {e}")
             await self._play_next_song(guild_id) # 次の曲へ
             return
 
         try:
-            audio_source = discord.FFmpegPCMAudio(song_path)
-            current_vc.play(audio_source, after=lambda e: self._after_playing(e, guild_id, song_name))
-            logger.info(f"'{song_name}' の再生を開始しました (ギルド {guild_id})")
+            # 現在再生中の情報を更新
+            self.currently_playing_info[guild_id] = {'path': song_path, 'name': song_name}
+            logger.info(f"_play_next_song: Preparing to play '{song_name}' in guild {guild_id}")
+
+            # FFmpegPCMAudioをPCMVolumeTransformerでラップして音量を調整
+            source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(song_path), volume=0.1) # 音量を調整
+            current_vc.play(source, after=lambda e: self._after_playing(e, guild_id, song_name))
+            logger.info(f"_play_next_song: '{song_name}' の再生を開始しました (ギルド {guild_id}) - 音量0.1")
         except Exception as e:
-            logger.error(f"_play_next_song でエラー (ギルド {guild_id}, 曲: {song_name}): {e}", exc_info=True)
+            logger.error(f"_play_next_song: 再生開始時にエラー (ギルド {guild_id}, 曲: {song_name}): {e}", exc_info=True)
             if current_vc.channel:
                 try:
                     await current_vc.channel.send(f"'{song_name}' の再生中に問題が発生したわ。スキップするわね。")
                 except Exception as send_e:
                     logger.error(f"再生エラー通知の送信エラー: {send_e}")
+            self.currently_playing_info.pop(guild_id, None) # 再生失敗したのでクリア
             await self._play_next_song(guild_id) # エラーが発生した場合でも、次の曲の再生を試みる
 
     @app_commands.command(name="listmusic", description="再生できる曲の一覧を表示するわ")
@@ -383,26 +402,80 @@ class MusicCog(commands.Cog):
 
     async def pause_current_song(self, guild_id: int):
         """指定されたギルドで再生中の音楽を一時停止するわ"""
+        logger.info(f"pause_current_song: Attempting to pause for guild {guild_id}. Currently playing info from self: {self.currently_playing_info.get(guild_id)}")
         vc = self.get_vc_connection(guild_id)
         if vc and vc.is_connected() and vc.is_playing():
-            vc.pause()
-            logger.info(f"音楽を一時停止しました (ギルド {guild_id}) - 外部呼び出し")
-            return True
-        return False
+            current_song_info = self.currently_playing_info.get(guild_id)
+            if current_song_info:
+                vc.pause()
+                # VoiceCogによる中断なので、再開情報を保存
+                self.song_details_to_resume_after_voice[guild_id] = current_song_info
+                logger.info(f"pause_current_song: Stored song_details_to_resume_after_voice for guild {guild_id}: {current_song_info}")
+                logger.info(f"音楽を一時停止しました (曲: {current_song_info['name']})。VoiceCogのため再開情報を保存 (ギルド {guild_id})")
+                return True # 正常に情報を保存してpauseした場合のみTrue
+            else:
+                # 再生中だがこちらの管理情報がない。これは異常系。
+                # VoiceCog側で再開を期待させないようにFalseを返す。
+                logger.warning(f"pause_current_song: VC is playing, but no current song info in MusicCog's state for guild {guild_id}. Pausing VC, but returning False as resume info cannot be stored.")
+                vc.pause() # 念のためVCは止める
+                return False # 再開情報がないので、VoiceCogにresumeを期待させない
+        else: # VCがない、接続されてない、または再生中でない
+            logger.info(f"pause_current_song: Conditions for pause not met. VC Connected: {vc.is_connected() if vc else False}, VC Playing: {vc.is_playing() if vc else False} (Guild {guild_id})")
+            return False
+
 
     async def resume_current_song(self, guild_id: int):
         """指定されたギルドで一時停止中の音楽を再開するわ"""
+        logger.info(f"resume_current_song: Called for guild {guild_id}")
         vc = self.get_vc_connection(guild_id)
-        if vc and vc.is_connected() and vc.is_paused():
-            vc.resume()
-            logger.info(f"音楽を再開しました (ギルド {guild_id}) - 外部呼び出し")
-            return True
-        elif vc and vc.is_connected() and not vc.is_playing() and self.music_queues.get(guild_id):
-            logger.info(f"音楽は停止していましたが、キューに曲があるので次の曲を再生します (ギルド {guild_id})")
-            await self._play_next_song(guild_id) # 完全に止まっていたら次の曲を再生
-            return True
-        return False
+        if not vc or not vc.is_connected():
+            logger.warning(f"resume_current_song: VCが見つからないか未接続です (ギルド {guild_id})")
+            self.song_details_to_resume_after_voice.pop(guild_id, None) # VCがないなら再開情報もクリア
+            return False
 
+        details_to_resume = self.song_details_to_resume_after_voice.pop(guild_id, None)
+        resumed_or_played_successfully = False
+
+        if details_to_resume:
+            song_path = details_to_resume['path']
+            song_name = details_to_resume['name']
+            logger.info(f"resume_current_song: VoiceCogによる中断から '{song_name}' の再開を試みます (ギルド {guild_id})")
+
+            if not os.path.exists(song_path):
+                logger.error(f"resume_current_song: 再開しようとした曲のファイルが見つかりません: {song_path} (ギルド {guild_id})")
+                # 再開失敗なので、キューから次に進むことを試みる
+            else:
+                try:
+                    if vc.is_playing() or vc.is_paused(): # VoiceCogの再生が終わった直後は止まっているはずだが念のため
+                        vc.stop()
+                    
+                    # 再開する曲を「現在再生中」として再設定
+                    self.currently_playing_info[guild_id] = {'path': song_path, 'name': song_name}
+                    
+                    source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(song_path), volume=0.1)
+                    vc.play(source, after=lambda e: self._after_playing(e, guild_id, song_name))
+                    logger.info(f"resume_current_song: 中断された曲 '{song_name}' を再開しました (ギルド {guild_id})")
+                    resumed_or_played_successfully = True
+                except Exception as e:
+                    logger.error(f"resume_current_song: '{song_name}' の再開中にエラー: {e}", exc_info=True)
+                    self.currently_playing_info.pop(guild_id, None) # 再生失敗したのでクリア
+                    # 再開失敗、キューから次に進むことを試みる
+
+        if not resumed_or_played_successfully:
+            logger.info(f"resume_current_song: 中断された曲の再開処理が完了したか、中断情報がありませんでした。VCの状態を確認します。Playing: {vc.is_playing()}, Paused: {vc.is_paused()} (ギルド {guild_id})")
+            if not vc.is_playing() and not vc.is_paused(): # VCが何もしていない状態なら
+                if self.music_queues.get(guild_id):
+                    logger.info(f"resume_current_song: キューに次の曲があるので再生します (ギルド {guild_id})")
+                    await self._play_next_song(guild_id) # _play_next_song が成功したかはそちらで判断
+                    resumed_or_played_successfully = True # play_next_songが試みられた
+                else:
+                    logger.info(f"resume_current_song: 再開する曲もキューも空です (ギルド {guild_id})")
+            else:
+                logger.warning(f"resume_current_song: VCが再生中または一時停止中です。次の曲の再生は行いません (ギルド {guild_id})")
+
+        return resumed_or_played_successfully
+
+# Bot起動時にCogを読み込むsetup関数
 async def setup(bot: commands.Bot):
     await bot.add_cog(MusicCog(bot), guilds=GUILDS)
     logger.info("MusicCogが正常にロードされました。")

@@ -125,8 +125,12 @@ class VoiceCog(commands.Cog):
                 else:
                     target_vc_for_voice = voice_cog_vc # VoiceCogが管理
 
-            if target_vc_for_voice.is_playing(): # 何か再生中なら止める (MusicCogの再生は既にpauseされているはず)
-                target_vc_for_voice.stop()
+            # target_vc_for_voice が active_music_vc と同じインスタンスで、かつ音楽が一時停止されている場合、
+            # VoiceCogが喋るために stop() を呼ぶと、MusicCogの再生状態がリセットされてしまう可能性がある。
+            # MusicCogがpauseしたVCをそのまま使う場合、VoiceCogはstop()を呼ばずにplay()を開始する。
+            if not (target_vc_for_voice == active_music_vc and self.music_pause_states.get(guild_id)) and target_vc_for_voice.is_playing():
+                logger.info(f"VoiceCog: target_vc is playing and not the paused music_vc. Stopping. (Guild {guild_id})")
+                target_vc_for_voice.stop() # MusicCogがpauseしたもの以外が再生中なら止める
 
             target_vc_for_voice.play(discord.FFmpegPCMAudio(source=wav_path), after=lambda e: self.after_playing(e, wav_path, guild_id))
             
@@ -142,11 +146,14 @@ class VoiceCog(commands.Cog):
 
             # 新しい自動退出タスクを開始
             # target_vc_for_voice が self.vc_connections[guild_id] と同じインスタンスか確認
-            if self.get_vc_connection(guild_id) == target_vc_for_voice and target_vc_for_voice.is_connected():
-                 logger.info(f"自動退出監視タスクを開始します (ギルド {guild_id}, チャンネル {target_vc_for_voice.channel.id})")
-                 task = self.bot.loop.create_task(self._check_and_auto_disconnect(guild_id, target_vc_for_voice.channel.id))
-                 self.auto_disconnect_tasks[guild_id] = task
-            else:
+            voice_cog_managed_vc = self.get_vc_connection(guild_id)
+            if voice_cog_managed_vc and voice_cog_managed_vc == target_vc_for_voice and target_vc_for_voice.is_connected():
+                logger.info(f"自動退出監視タスクを開始します (ギルド {guild_id}, チャンネル {target_vc_for_voice.channel.id})")
+                task = self.bot.loop.create_task(self._check_and_auto_disconnect(guild_id, target_vc_for_voice.channel.id))
+                self.auto_disconnect_tasks[guild_id] = task
+            elif target_vc_for_voice == active_music_vc:
+                logger.info(f"MusicCogのVCを借用中のため、VoiceCogによる自動退出監視は開始しません (ギルド {guild_id})")
+            else: # VoiceCogが管理するVCでもなく、MusicCogのVCでもない場合 (または接続エラーなど)
                 logger.warning(f"VC接続がないため自動退出監視を開始しません (ギルド {guild_id})")
 
         except Exception as e:
@@ -211,4 +218,3 @@ async def setup(bot: commands.Bot):
     gemini_h = GeminiHandler()
     await bot.add_cog(VoiceCog(bot, gemini_h), guilds=GUILDS)
     logger.info("VoiceCogが正常にロードされました。")
-
