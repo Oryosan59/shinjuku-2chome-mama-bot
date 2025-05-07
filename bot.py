@@ -27,7 +27,8 @@ bot = commands.Bot(command_prefix="!", intents=intents) # client から bot に�
 # Cogのファイル名 (拡張子なし)
 INITIAL_EXTENSIONS = [
     'cogs.ask_cog',
-    'cogs.voice_cog'
+    'cogs.voice_cog',
+    'cogs.music_cog' # MusicCogを追加
 ]
 
 # Botが起動したときに実行される処理
