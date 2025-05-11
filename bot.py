@@ -70,6 +70,22 @@ async def on_ready():
     except Exception as e:
         logger.error(f"on_ready処理中にエラー: {e}", exc_info=True)
 
+# ボットをログアウトさせるコマンド (オーナーのみ)
+@bot.command(name='logout', hidden=True) # hidden=True でヘルプに表示しない
+@commands.is_owner()
+async def logout_command(ctx):
+    """ボットをログアウトさせます（オーナーのみ）。"""
+    logger.info(f"{ctx.author} によりログアウトコマンドが実行されました。")
+    await ctx.send("アタシ、ちょっと休憩するわね…。また後で会いましょう。")
+    await bot.close()
+
+@logout_command.error
+async def logout_command_error(ctx, error):
+    if isinstance(error, commands.NotOwner):
+        await ctx.send("あら、あなたにはアタシを休ませる権限はないみたいよ？")
+    else:
+        logger.error(f"logoutコマンドで予期せぬエラー: {error}", exc_info=True)
+        await ctx.send("あらやだ、なんだかおかしなことになっちゃったわ…")
 # ボットを起動（トークンが存在すれば）
 async def main():
     if not DISCORD_BOT_TOKEN:
