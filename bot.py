@@ -12,12 +12,11 @@ from config import DISCORD_BOT_TOKEN, GEMINI_API_KEY, GUILDS, PROMPT_Q_FILE_PATH
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# プロンプトファイルの存在確認と読み込み（エラーハンドリングはconfig側で行う想定だが、念のためここでも）
-if not os.path.exists(PROMPT_Q_FILE_PATH):
-    logger.warning(f"qコマンド用プロンプトファイルが見つかりません: {PROMPT_Q_FILE_PATH}")
-if not os.path.exists(PROMPT_VOICE_FILE_PATH):
-    logger.warning(f"voiceコマンド用プロンプトファイルが見つかりません: {PROMPT_VOICE_FILE_PATH}")
-
+# プロンプトファイルの読み込みとフォールバックはconfig.py側で行われるため、
+# bot.py側での存在確認は不要になります。
+# PROMPT_Q_FILE_PATH や PROMPT_VOICE_FILE_PATH が None の場合でも、
+# config.py 内で BASE_Q_PROMPT などにフォールバック値が設定されるため、
+# Cog 側ではプロンプト文字列が常に利用可能です。
 
 # Discordボットの基本設定
 intents = discord.Intents.default()  # デフォルトのインテントを使用

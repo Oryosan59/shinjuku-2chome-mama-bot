@@ -4,7 +4,7 @@ from discord.ext import commands
 from discord import app_commands
 import logging, math
 import os
-import asyncio
+import asyncio, enum # enumを追加
 from pathlib import Path # フォルダパスの操作のために追加
 from config import GUILDS # configからGUILDSを読み込み
 
@@ -13,6 +13,11 @@ logger = logging.getLogger(__name__)
 MUSIC_DIR = "music" # プロジェクトルートからの相対パス
 ITEMS_PER_PAGE = 20 # /listmusic で1ページに表示する曲数
 ITEMS_IN_SUMMARY = 5 # /playfolder などで表示する曲数の上限
+
+class RepeatMode(enum.Enum):
+    NONE = 0    # リピートなし
+    ONE = 1     # 現在の曲をリピート
+    ALL = 2     # キュー全体をリピート
 
 class MusicListView(discord.ui.View):
     def __init__(self, music_files_details: list[tuple[str, str]], author_id: int):
@@ -70,6 +75,7 @@ class MusicCog(commands.Cog):
         self.currently_playing_info = {} # ギルドID: {'path': str, 'name': str} 現在再生中の曲情報
         self.song_details_to_resume_after_voice = {} # ギルドID: {'path': str, 'name': str} VoiceCogによる中断後再開する曲
         self.last_text_channel_ids = {} # ギルドID: 最後に音楽コマンドが使われたテキストチャンネルID
+        self.repeat_modes = {} # ギルドID: RepeatMode (デフォルトは RepeatMode.NONE)
         self._ensure_music_dir()
 
     def _ensure_music_dir(self):
@@ -109,12 +115,29 @@ class MusicCog(commands.Cog):
         
         music_files_details.sort(key=lambda x: x[1]) # display_name (相対パス) でソート
         return music_files_details
-    def _after_playing(self, error, guild_id: int, song_name_played: str):
-        logger.info(f'_after_playing: Song "{song_name_played}" finished/stopped for guild {guild_id}. Error: {error}')
+
+    def _after_playing(self, error, guild_id: int, song_path_played: str, song_name_played: str):
+        logger.info(f'_after_playing: Song "{song_name_played}" (Path: {song_path_played}) finished/stopped for guild {guild_id}. Error: {error}')
+        
+        # 再生が終わった曲の情報を取得 (リピート処理で使うため pop する前に)
+        # currently_playing_info は _play_next_song で設定されるが、_after_playing の時点ではまだ残っているはず
+        # しかし、song_path_played と song_name_played を引数で受け取るようにしたので、そちらを使用する
+
         self.currently_playing_info.pop(guild_id, None) # 現在再生中の情報をクリア
 
         if error:
             logger.error(f'音楽再生エラー (ギルド {guild_id}, 曲: {song_name_played}): {error}')
+
+        current_repeat_mode = self.repeat_modes.get(guild_id, RepeatMode.NONE)
+        queue = self.music_queues.setdefault(guild_id, [])
+
+        if song_path_played and song_name_played: # 有効な曲情報がある場合のみリピート処理
+            if current_repeat_mode == RepeatMode.ONE:
+                queue.insert(0, (song_path_played, song_name_played))
+                logger.info(f"[Guild {guild_id}] リピート(1曲): {song_name_played} をキューの先頭に追加しました。")
+            elif current_repeat_mode == RepeatMode.ALL:
+                queue.append((song_path_played, song_name_played))
+                logger.info(f"[Guild {guild_id}] リピート(全曲): {song_name_played} をキューの末尾に追加しました。")
 
         # VoiceCogによる中断からの再開が保留されている場合は、自動で次の曲へは進まない
         if guild_id not in self.song_details_to_resume_after_voice:
@@ -125,8 +148,6 @@ class MusicCog(commands.Cog):
                 logger.warning(f"_after_playing: Bot loop not running, cannot play next song for guild {guild_id}")
         else:
             logger.info(f"_after_playing: Voice interruption detected (resume pending for {self.song_details_to_resume_after_voice.get(guild_id, {}).get('name')}) for guild {guild_id}. Not playing next song automatically.")
-
-
 
     async def _play_next_song(self, guild_id: int):
         """キューから次の曲を再生する内部メソッド"""
@@ -178,7 +199,7 @@ class MusicCog(commands.Cog):
 
             # FFmpegPCMAudioをPCMVolumeTransformerでラップして音量を調整
             source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(song_path), volume=0.1) # 音量を調整
-            current_vc.play(source, after=lambda e: self._after_playing(e, guild_id, song_name))
+            current_vc.play(source, after=lambda e: self._after_playing(e, guild_id, song_path, song_name)) # song_pathも渡す
             
             log_message = f"'{song_name}' の再生を開始するわよ♬ (ギルド {guild_id})"
             logger.info(log_message)
@@ -520,11 +541,19 @@ class MusicCog(commands.Cog):
             await interaction.followup.send("音楽キューは空っぽよ。何かリクエストしてちょうだい💋")
             return
 
+        current_repeat_mode = self.repeat_modes.get(guild_id, RepeatMode.NONE)
+        mode_text = "オフ"
+        if current_repeat_mode == RepeatMode.ONE:
+            mode_text = "現在の曲をリピート"
+        elif current_repeat_mode == RepeatMode.ALL:
+            mode_text = "キュー全体をリピート"
+
         embed = discord.Embed(title="🎵 再生待機中の曲リスト 🎵", color=discord.Color.purple())
         
         queue_description = ""
         # キューの曲は (song_path, song_name) のタプル
-        for i, (_, song_name) in enumerate(queue): # song_name は表示名 (例: J-POP/曲.mp3)
+        # 最大10曲表示（多すぎるとメッセージが長くなるため）
+        for i, (_, song_name) in enumerate(queue[:10]): # song_name は表示名 (例: J-POP/曲.mp3)
             queue_description += f"{i+1}. {song_name}\n"
         
         if not queue_description:
@@ -532,7 +561,9 @@ class MusicCog(commands.Cog):
              return
 
         embed.description = queue_description
-        embed.set_footer(text=f"全 {len(queue)} 曲が待機中")
+        if len(queue) > 10:
+            queue_description += f"...他{len(queue)-10}曲"
+        embed.set_footer(text=f"全 {len(queue)} 曲が待機中 | リピートモード: {mode_text}")
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="clearmusicqueue", description="音楽再生キューを空にするわ")
@@ -599,6 +630,35 @@ class MusicCog(commands.Cog):
                 await interaction.response.send_message("アタシ、今ボイスチャンネルにいないみたいだけど、キューはクリアしておいたわ。", ephemeral=True)
             else:
                 await interaction.response.send_message("アタシ、今ボイスチャンネルにいないみたいよ。", ephemeral=True)
+
+    @app_commands.command(name="repeatmusic", description="音楽の再生リピートモードを設定するわ")
+    @app_commands.describe(mode="リピートモードを選んでちょうだい (off, one, all)")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="オフ (リピートなし)", value="off"),
+        app_commands.Choice(name="現在の曲をリピート", value="one"),
+        app_commands.Choice(name="キュー全体をリピート", value="all"),
+    ])
+    @app_commands.guilds(*GUILDS)
+    async def repeat_music_command(self, interaction: discord.Interaction, mode: app_commands.Choice[str]):
+        logger.info(f"/repeatmusic mode: {mode.value} from {interaction.user} in {interaction.guild.name}")
+        if not interaction.guild:
+            await interaction.response.send_message("このコマンドはサーバー内でのみ使用可能です。", ephemeral=True)
+            return
+        
+        guild_id = interaction.guild.id
+        chosen_mode_str = mode.value.lower()
+
+        if chosen_mode_str == "off":
+            self.repeat_modes[guild_id] = RepeatMode.NONE
+            await interaction.response.send_message("リピートをオフにしたわ。")
+        elif chosen_mode_str == "one":
+            self.repeat_modes[guild_id] = RepeatMode.ONE
+            await interaction.response.send_message("今の曲をリピートするわね。")
+        elif chosen_mode_str == "all":
+            self.repeat_modes[guild_id] = RepeatMode.ALL
+            await interaction.response.send_message("キューに入ってる曲を全部リピートするわよ。")
+        else: # 通常ここには到達しない
+            await interaction.response.send_message("あら、よくわからないモードね。`off`, `one`, `all` から選んでちょうだい。", ephemeral=True)
 
     async def pause_current_song(self, guild_id: int):
         """指定されたギルドで再生中の音楽を一時停止するわ"""
